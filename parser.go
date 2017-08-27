@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"errors"
 	"strings"
+	"strconv"
 )
 
 
@@ -12,39 +13,326 @@ import (
 // TOKENS
 // A string is parsed into a list of tokens.
 // ----------------------------------------------------------------------------
-type TokenName int
+type TokenName string
 const (
-	IDENTIFIER TokenName = iota
-	CALL_IN TokenName = iota
-	CALL_OUT TokenName = iota
+	IDENTIFIER TokenName = "IDENTIFIER"
+	STRING_LITERAL = "STRING_LITERAL"
+	INTEGER_LITERAL = "INTEGER_LITERAL"
+	FLOAT_LITERAL = "FLOAT_LITERAL"
+	WHITESPACE = "WHITESPACE"
+
+	ITEM_SEPERATOR = "ITEM_SEPERATOR"
+	CALL_IN = "CALL_IN"
+	CALL_OUT = "CALL_OUT"
+	ARG_LIST_IN = "ARG_LIST_IN"
+	ARG_LIST_OUT = "ARG_LIST_OUT"
+	BLOCK_IN = "BLOCK_IN"
+	BLOCK_OUT = "BLOCK_OUT"
+
+	// The root AST node
+	ROOT = "ROOT"
+	CALL_EXPRESSION = "CALL_EXPRESSION"
+	ARG_LIST_EXPRESSION = "ARG_LIST_EXPRESSION"
+	BLOCK_EXPRESSION = "BLOCK_EXPRESSION"
 )
 
 type Token struct {
 	Name TokenName
 	Shape *regexp.Regexp
 	Data []string
+
+	// Called before a new ast frame is created
+	HookPreNew func([]string, *AstFrame, string, int) (map[string]interface{}, *AstFrame, error)
+	// Called after a new ast frame is created
+	HookPostNew func([]string, *AstFrame, string, int) (*AstFrame, error)
 }
+var EMPTY_DATA map[string]interface{} = nil
 
 var TOKENS = []Token{
+
+
 	Token{
-		Name: IDENTIFIER,
-		Shape: regexp.MustCompile(`^([a-zA-Z0-9_])+`),
+		Name: WHITESPACE,
+		Shape: regexp.MustCompile(`^[\n\t ]+`),
 	},
+	Token{
+		Name: ITEM_SEPERATOR,
+		Shape: regexp.MustCompile(`^,`),
+	},
+
 	Token{
 		Name: CALL_IN,
 		Shape: regexp.MustCompile(`^\(`),
+
+		// Create a new stack frame for the function invocation.
+		HookPreNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (map[string]interface{}, *AstFrame, error) {
+			// Figure out the name of the thing that is being called.
+			var callee *AstFrame
+			if len(ast.Children) > 0 {
+				callee = ast.Children[len(ast.Children)-1]
+
+				// Remove the callee from the list of children.
+				if len(ast.Children) == 1 {
+					ast.Children = make([]*AstFrame, 0)
+				} else {
+					ast.Children = ast.Children[:1]
+				}
+			} else {
+				// Can't find a callee!
+				return nil, ast, ParseError(
+					inp, pointer,
+					"No callee identifier found before leading parenthesis in call expression.",
+				)
+			}
+
+			newFrame := &AstFrame{
+				Name: CALL_EXPRESSION,
+				Data: map[string]interface{}{"Callee": callee},
+				Parent: ast,
+			}
+
+			// Add new frame to existing AST
+			ast.Children = append(ast.Children, newFrame)
+
+			return EMPTY_DATA, newFrame, nil
+		},
 	},
 	Token{
 		Name: CALL_OUT,
 		Shape: regexp.MustCompile(`^\)`),
+
+		// Move to the previous stack frame.
+		HookPostNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (*AstFrame, error) {
+			var data []*AstFrame
+
+			lastItemWasAnItemSeperator := true
+			for index, child := range ast.Children {
+				if child.Name == WHITESPACE { continue }
+				if child.Name == ITEM_SEPERATOR {
+					if lastItemWasAnItemSeperator {
+						return ast, ParseError(
+							inp, pointer,
+							fmt.Sprintf("Two item seperators were found in a row!"),
+						)
+					} else {
+						continue
+					}
+				}
+				if index == 0 && child.Name == CALL_IN { continue }
+				if index == len(ast.Children) - 1 && child.Name == CALL_OUT { continue }
+
+				if child.Name == ITEM_SEPERATOR {
+					lastItemWasAnItemSeperator = true
+				} else {
+					lastItemWasAnItemSeperator = false
+					data = append(data, child)
+				}
+			}
+
+			ast.Data = map[string]interface{}{ "Arguments": data }
+			return ast.Parent, nil
+		},
+	},
+
+	Token{
+		Name: BLOCK_IN,
+		Shape: regexp.MustCompile(`^do`),
+
+		// Create a new stack frame for the function invocation.
+		HookPreNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (map[string]interface{}, *AstFrame, error) {
+			newFrame := &AstFrame{
+				Name: BLOCK_EXPRESSION,
+				Data: EMPTY_DATA,
+				Parent: ast,
+			}
+
+			// Add new frame to existing AST
+			ast.Children = append(ast.Children, newFrame)
+
+			return EMPTY_DATA, newFrame, nil
+		},
+	},
+	Token{
+		Name: BLOCK_OUT,
+		Shape: regexp.MustCompile(`^end`),
+
+		// Move to the previous stack frame.
+		HookPostNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (*AstFrame, error) {
+			return ast.Parent, nil
+		},
+	},
+
+	Token{
+		Name: ARG_LIST_IN,
+		Shape: regexp.MustCompile(`^<`),
+
+		// Create a new stack frame for the function invocation.
+		HookPreNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (map[string]interface{}, *AstFrame, error) {
+			newFrame := &AstFrame{
+				Name: ARG_LIST_EXPRESSION,
+				Data: EMPTY_DATA,
+				Parent: ast,
+			}
+
+			// Add new frame to existing AST
+			ast.Children = append(ast.Children, newFrame)
+
+			return EMPTY_DATA, newFrame, nil
+		},
+	},
+	Token{
+		Name: ARG_LIST_OUT,
+		Shape: regexp.MustCompile(`^>`),
+
+		// Move to the previous stack frame.
+		HookPostNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (*AstFrame, error) {
+			var data []*AstFrame
+
+			lastItemWasAnItemSeperator := true
+			for index, child := range ast.Children {
+				if child.Name == WHITESPACE { continue }
+				if child.Name == ITEM_SEPERATOR {
+					if lastItemWasAnItemSeperator {
+						return ast, ParseError(
+							inp, pointer,
+							fmt.Sprintf("Two item seperators were found in a row!"),
+						)
+					} else {
+						continue
+					}
+				}
+				if index == 0 && child.Name == ARG_LIST_IN { continue }
+				if index == len(ast.Children) - 1 && child.Name == ARG_LIST_OUT { continue }
+
+				if child.Name == ITEM_SEPERATOR {
+					lastItemWasAnItemSeperator = true
+				} else {
+					lastItemWasAnItemSeperator = false
+					data = append(data, child)
+				}
+			}
+
+			ast.Data = map[string]interface{}{ "Arguments": data }
+			return ast.Parent, nil
+		},
+	},
+
+
+	// Parse different literal values
+	Token{
+		Name: STRING_LITERAL,
+		Shape: regexp.MustCompile(`^"([^"]*)"`),
+
+		// Add the string content inside of the data for the token
+		HookPreNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (map[string]interface{}, *AstFrame, error) {
+			return map[string]interface{}{ "Content": match[1] }, ast, nil
+		},
+	},
+	Token{
+		Name: FLOAT_LITERAL,
+		Shape: regexp.MustCompile(`^[0-9_]+\.[0-9_]*`),
+
+		// Add the string content inside of the data for the token
+		HookPreNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (map[string]interface{}, *AstFrame, error) {
+			float, err := strconv.ParseFloat(strings.Replace(match[0], "_", "", -1), 64)
+
+			if err != nil {
+				return EMPTY_DATA, ast, ParseError(
+					inp, pointer,
+					"Error parsing float from source: "+err.Error(),
+				)
+			}
+
+			return map[string]interface{}{ "Content": float }, ast, nil
+		},
+	},
+	Token{
+		Name: INTEGER_LITERAL,
+		Shape: regexp.MustCompile(`^[0-9_]+`),
+
+		// Add the string content inside of the data for the token
+		HookPreNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (map[string]interface{}, *AstFrame, error) {
+			integer, err := strconv.Atoi(strings.Replace(match[0], "_", "", -1))
+
+			if err != nil {
+				return EMPTY_DATA, ast, ParseError(
+					inp, pointer,
+					"Error parsing integer from source: "+err.Error(),
+				)
+			}
+
+			return map[string]interface{}{ "Content": integer }, ast, nil
+		},
+	},
+
+	Token{
+		Name: IDENTIFIER,
+		Shape: regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*`),
+
+		// Add the identifier name inside of the data when a new one is created.
+		HookPreNew: func(
+			match []string,
+			ast *AstFrame,
+			inp string,
+			pointer int,
+		) (map[string]interface{}, *AstFrame, error) {
+			return map[string]interface{}{ "Name": match[0] }, ast, nil
+		},
 	},
 }
 
 
 type AstFrame struct {
 	Name TokenName
-	Data map[string]interface{}
 	Children []*AstFrame
+	Parent *AstFrame
+
+	Data map[string]interface{}
 }
 
 // When an erro happens in the parse step, print out a pretty error, like the below:
@@ -93,22 +381,47 @@ func ParseError(inp string, pointer int, err string) error {
 	))
 }
 
-func Parser(inp string) ([]Token, error) {
-	var tokens []Token
+func Parser(inp string) (*AstFrame, error) {
+	var ast AstFrame = AstFrame{Name: ROOT, Parent: nil}
+	var currentFrame *AstFrame = &ast
+
+	// Used when running hooks. Defined once and reused for each invocation.
+	var err error
 
 	// Contains the current index in `inp`
 	pointer := 0
 
 	// While items can be pulled off the front of the input...
-	for len(inp) > 0 {
+	outer:
+	for pointer < len(inp) {
 		// Try to find a token that matches.
 		for _, token := range TOKENS {
 			if match := token.Shape.FindStringSubmatch(inp[pointer:]); len(match) > 0 {
+				// Call the pre token hook to hopefully get the contents of the data to put intide
+				// that ast frame.
+				data := EMPTY_DATA
+				if token.HookPreNew != nil {
+					data, currentFrame, err = token.HookPreNew(match, currentFrame, inp, pointer)
+					if err != nil { return nil, err }
+				}
+
 				// Add matching tokens to the token list, and clear the accumulator so we can find
 				// the next token.
-				tokens = append(tokens, Token{Name: token.Name, Shape: token.Shape, Data: match})
+				currentFrame.Children = append(currentFrame.Children, &AstFrame{
+					Name: token.Name,
+					Data: data,
+					Parent: currentFrame,
+				})
+
+				// Call the pre token hook to hopefully get the contents of the data to put intide
+				// that ast frame.
+				if token.HookPostNew != nil {
+					currentFrame, err = token.HookPostNew(match, currentFrame, inp, pointer)
+					if err != nil { return nil, err }
+				}
+
 				pointer += len(match[0])
-				continue
+				continue outer;
 			}
 		}
 
@@ -116,18 +429,43 @@ func Parser(inp string) ([]Token, error) {
 		return nil, ParseError(inp, pointer, "No valid token found!")
 	}
 
-	return tokens, nil
+	// Make sure that on parsing completion, we're back at the root ast node.
+	if currentFrame != &ast {
+		return nil, ParseError(inp, pointer, "When parsing, finished in a frame deeper than the top frame.")
+	}
+
+	return &ast, nil
 }
 
+func PrintAst(ast *AstFrame, indentation string) {
+	for _, child := range ast.Children {
+		fmt.Printf("%s- %s (%+v)", indentation, child.Name, child.Data)
+
+		if value, ok := child.Data["Callee"]; ok {
+			fmt.Printf("  Callee=%+v", value)
+		}
+
+		fmt.Printf("\n")
+		PrintAst(child, indentation+"  ")
+	}
+}
 
 func main() {
-	// data := "foo('bar')\nbaz"
-	data := "foo('bar')"
-	tokens, err := Parser(data)
+	// data := `
+	// func(my_func <a b c> do
+	// 	foo("bar", 123.456)
+	// end)
+	// `
+	data := `do
+		func(a<b> do 1 end)
+		foo()
+	end`
+	// data := "foo(\"bar\")"
+	ast, err := Parser(data)
 	if err != nil {
-		fmt.Println("Error parsing:", err)
+		fmt.Println(err)
 	} else {
-		fmt.Println("Tokens:")
-		fmt.Println(tokens)
+		fmt.Println("Ast:")
+		PrintAst(ast, "")
 	}
 }
